@@ -935,12 +935,12 @@ func (m *manager) createAvalancheChain(
 		Params:              consensusParams,
 		Consensus:           snowmanConsensus,
 	}
-	var snowmanEngine common.Engine
-	snowmanEngine, err = smeng.New(snowmanEngineConfig)
+	smEngine, err := smeng.New(snowmanEngineConfig)
 	if err != nil {
 		return nil, fmt.Errorf("error initializing snowman engine: %w", err)
 	}
 
+	var snowmanEngine common.Engine = smEngine
 	if m.TracingEnabled {
 		snowmanEngine = common.TraceEngine(snowmanEngine, m.Tracer)
 	}
@@ -964,7 +964,13 @@ func (m *manager) createAvalancheChain(
 	var snowmanBootstrapper common.BootstrapableEngine
 	snowmanBootstrapper, err = smbootstrap.New(
 		bootstrapCfg,
-		snowmanEngine.Start,
+		func(ctx context.Context, startReqID uint32) error {
+			if err := snowmanEngine.Start(ctx, startReqID); err != nil {
+				return err
+			}
+			smEngine.StartPoMLifecycle()
+			return nil
+		},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error initializing snowman bootstrapper: %w", err)
@@ -1319,6 +1325,20 @@ func (m *manager) createSnowmanChain(
 	if err != nil {
 		return nil, fmt.Errorf("couldn't initialize snow base message handler: %w", err)
 	}
+	// ============================================================================
+	// PoM: Override consensus parameters for Proof of Majority
+	// This must happen BEFORE creating the consensus instance
+	// ============================================================================
+	consensusParams.Beta = 1
+	consensusParams.ConcurrentRepolls = 1
+
+	ctx.Log.Info("PoM: Consensus parameters configured",
+		zap.Int("K", consensusParams.K),
+		zap.Int("AlphaPreference", consensusParams.AlphaPreference),
+		zap.Int("Beta", consensusParams.Beta),
+		zap.Int("ConcurrentRepolls", consensusParams.ConcurrentRepolls),
+	)
+	// ============================================================================
 
 	var consensus smcon.Consensus = &smcon.Topological{Factory: snowball.SnowflakeFactory}
 	if m.TracingEnabled {
