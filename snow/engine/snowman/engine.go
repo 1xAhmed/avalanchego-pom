@@ -92,10 +92,22 @@ type Engine struct {
 	// number of times build block needs to be called once the number of
 	// processing blocks has gone below the optimal number.
 	pendingBuildBlocks int
+
+	// PoM Lifecycle Controls
+	epochTicker   *time.Ticker
+	stopEpoch     chan struct{}
+	epochDuration time.Duration
 }
 
 func New(config Config) (*Engine, error) {
 	config.Ctx.Log.Info("initializing consensus engine")
+
+	config.Ctx.Log.Info("PoM: Consensus parameters",
+		zap.Int("K", config.Params.K),
+		zap.Int("Alpha", config.Params.AlphaPreference),
+		zap.Int("Beta", config.Params.Beta),
+		zap.Int("ConcurrentRepolls", config.Params.ConcurrentRepolls),
+	)
 
 	nonVerifiedCache, err := metercacher.New[ids.ID, snowman.Block](
 		"non_verified_cache",
@@ -433,7 +445,12 @@ func (e *Engine) QueryFailed(ctx context.Context, nodeID ids.NodeID, requestID u
 
 func (e *Engine) Shutdown(ctx context.Context) error {
 	e.Ctx.Log.Info("shutting down consensus engine")
-
+	if e.stopEpoch != nil {
+		close(e.stopEpoch)
+	}
+	if e.epochTicker != nil {
+		e.epochTicker.Stop()
+	}
 	e.Ctx.Lock.Lock()
 	defer e.Ctx.Lock.Unlock()
 
@@ -443,9 +460,14 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 func (e *Engine) Notify(ctx context.Context, msg common.Message) error {
 	switch msg {
 	case common.PendingTxs:
-		// the pending txs message means we should attempt to build a block.
-		e.pendingBuildBlocks++
-		return e.executeDeferredWork(ctx)
+		// // the pending txs message means we should attempt to build a block.
+		// e.pendingBuildBlocks++
+		// return e.executeDeferredWork(ctx)
+
+		// e.pendingBuildBlocks++
+		// return e.executeDeferredWork(ctx)
+		e.Ctx.Log.Verbo("PoM: Received PendingTxs, waiting for next Epoch")
+		return nil
 	case common.StateSyncDone:
 		e.Ctx.StateSyncing.Set(false)
 		return nil
@@ -522,6 +544,7 @@ func (e *Engine) Start(ctx context.Context, startReqID uint32) error {
 		return fmt.Errorf("failed to notify VM that consensus is starting: %w",
 			err)
 	}
+
 	return e.executeDeferredWork(ctx)
 }
 
@@ -1199,4 +1222,130 @@ func (e *Engine) isDecided(blk snowman.Block) bool {
 	parentHeight := height - 1
 	parentID := blk.Parent()
 	return parentHeight == lastAcceptedHeight && parentID != lastAcceptedID // the parent was rejected
+}
+
+// StartPoMLifecycle initializes the Proof of Majority heartbeat
+func (e *Engine) StartPoMLifecycle() {
+	e.Ctx.Log.Info("PoM: Starting Consensus Lifecycle")
+
+	e.epochDuration = 2 * time.Second
+	e.epochTicker = time.NewTicker(e.epochDuration)
+	e.stopEpoch = make(chan struct{})
+
+	go func() {
+		// Wait for 30 seconds to allow full bootstrap and health checks
+		time.Sleep(30 * time.Second)
+
+		e.Ctx.Log.Info("PoM: Heartbeat Active")
+		for {
+			select {
+			case <-e.stopEpoch:
+				return
+			case <-e.epochTicker.C:
+				// Only run if we are in NormalOp
+				if e.Ctx.State.Get().State != snow.NormalOp {
+					continue
+				}
+				e.runEpoch()
+			}
+		}
+	}()
+}
+
+// runEpoch executes one full PoM cycle
+func (e *Engine) runEpoch() {
+	ctx := context.Background()
+
+	// PHASE 1: Read State (Brief Lock - NO NETWORK)
+	e.Ctx.Lock.Lock()
+	_, lastHeight := e.Consensus.LastAccepted()
+	currentEpoch := lastHeight + 1
+
+	numValidators := e.Validators.NumValidators(e.Ctx.SubnetID)
+	if numValidators == 0 {
+		e.Ctx.Log.Info("PoM: No peers, skipping epoch", zap.Uint64("epoch", currentEpoch))
+		e.Ctx.Lock.Unlock()
+		return
+	}
+	e.Ctx.Lock.Unlock()
+
+	e.Ctx.Log.Info("PoM: Starting Epoch", zap.Uint64("epoch", currentEpoch))
+
+	// PHASE 2: Transaction Propagation
+	// Gossip() sends network messages
+	if err := e.Gossip(ctx); err != nil {
+		e.Ctx.Log.Warn("PoM: Gossip failed", zap.Error(err))
+	}
+
+	// Wait for propagation
+	time.Sleep(500 * time.Millisecond)
+
+	// PHASE 3: Block Building
+	e.Ctx.Lock.Lock()
+	blk, err := e.VM.BuildBlock(ctx)
+	if err != nil {
+		e.Ctx.Log.Info("PoM: No pending transactions to build block", zap.Uint64("epoch", currentEpoch))
+		e.Ctx.Lock.Unlock()
+		return
+	}
+
+	if blk.Height() != currentEpoch {
+		e.Ctx.Log.Warn("PoM: Block height mismatch",
+			zap.Uint64("expected", currentEpoch),
+			zap.Uint64("actual", blk.Height()))
+	}
+
+	// Add to consensus
+	added, err := e.addUnverifiedBlockToConsensus(ctx, e.Ctx.NodeID, blk, e.metrics.issued.WithLabelValues("pom_built"))
+	if err != nil {
+		e.Ctx.Log.Error("PoM: Failed to add local block", zap.Error(err))
+		e.Ctx.Lock.Unlock()
+		return
+	}
+	if !added {
+		e.Ctx.Log.Warn("PoM: Local block rejected")
+		e.Ctx.Lock.Unlock()
+		return
+	}
+
+	blkID := blk.ID()
+	blkBytes := blk.Bytes()
+	e.Ctx.Lock.Unlock()
+
+	// PHASE 4: Network Voting
+	// Sample validators
+	e.Ctx.Lock.Lock()
+	totalValidators := e.Validators.NumValidators(e.Ctx.SubnetID)
+	if totalValidators == 0 {
+		e.Ctx.Lock.Unlock()
+		return
+	}
+
+	sampleSize := int(totalValidators)
+	validators, err := e.Validators.Sample(e.Ctx.SubnetID, sampleSize)
+	if err != nil {
+		e.Ctx.Log.Warn("PoM: Failed to sample validators", zap.Error(err))
+		e.Ctx.Lock.Unlock()
+		return
+	}
+
+	// Register poll
+	e.requestID++
+	requestID := e.requestID
+
+	vdrBag := bag.Of(validators...)
+	if !e.polls.Add(requestID, vdrBag) {
+		e.Ctx.Log.Error("PoM: Failed to add poll", zap.Uint32("requestID", requestID))
+		e.Ctx.Lock.Unlock()
+		return
+	}
+	e.Ctx.Lock.Unlock()
+
+	// Send network message
+	e.Sender.SendPushQuery(ctx, set.Of(validators...), requestID, blkBytes, 0)
+
+	e.Ctx.Log.Info("PoM: Proposed block",
+		zap.Uint64("epoch", currentEpoch),
+		zap.Stringer("blkID", blkID),
+		zap.Int("validators", len(validators)))
 }
